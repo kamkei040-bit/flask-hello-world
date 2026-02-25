@@ -4,8 +4,17 @@ import base64
 import requests
 from flask import Flask, request
 from openai import OpenAI
+import time
+import re
 
 app = Flask(__name__)
+
+app = Flask(__name__)
+
+# ユーザーごとに直近の解析結果を保存（メモリ上：Render再起動で消えます）
+USER_STATE = {}  # { userId: {"ts": epoch, "shipping_yen": int|None, "price_low": int|None, "price_high": int|None, "name": str, "keywords": [..]} }
+STATE_TTL_SEC = 60 * 60 * 6  # 6時間
+
 
 LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
