@@ -5,100 +5,75 @@ import hmac
 import hashlib
 import base64
 import requests
-from openai import OpenAI
 
 app = Flask(__name__)
 
-LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
-LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-
-def verify_line_signature(body: str, signature: str) -> bool:
-    if not LINE_CHANNEL_SECRET or not signature:
+def verify_line_signature(body: bytes, signature: str) -> bool:
+    if not LINE_CHANNEL_SECRET:
         return False
-    hash_bytes = hmac.new(
-        LINE_CHANNEL_SECRET.encode("utf-8"),
-        body.encode("utf-8"),
-        hashlib.sha256
-    ).digest()
-    expected = base64.b64encode(hash_bytes).decode("utf-8")
-    return hmac.compare_digest(expected, signature)
+    hash_ = hmac.new(LINE_CHANNEL_SECRET.encode("utf-8"), body, hashlib.sha256).digest()
+    computed = base64.b64encode(hash_).decode("utf-8")
+    return hmac.compare_digest(computed, signature)
 
-
-def line_reply(reply_token: str, messages: list[dict]):
+def reply_message(reply_token: str, messages: list[dict]):
     url = "https://api.line.me/v2/bot/message/reply"
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
     }
     payload = {"replyToken": reply_token, "messages": messages}
     r = requests.post(url, headers=headers, data=json.dumps(payload))
-    return r.status_code, r.text
+    print("LINE reply status:", r.status_code, r.text)
+    return r
 
-
-def fetch_line_image_bytes(message_id: str) -> bytes:
-    url = f"https://api.line.me/v2/bot/message/{message_id}/content"
-    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
-    r = requests.get(url, headers=headers)
-    r.raise_for_status()
-    return r.content
-
-
-@app.route("/")
+@app.route("/", methods=["GET"])
 def home():
     return "LINE Bot is running"
 
-
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    body = request.get_data(as_text=True)
+    body = request.get_data()  # bytes
     signature = request.headers.get("X-Line-Signature", "")
 
-    # 署名検証（ちゃんとしたBot運用に必須）
     if not verify_line_signature(body, signature):
+        print("Invalid signature")
         abort(400)
 
-    data = json.loads(body)
+    data = request.json
+    print("Received from LINE:", json.dumps(data, ensure_ascii=False))
 
     events = data.get("events", [])
     for event in events:
-        if event.get("type") != "message":
+        reply_token = event.get("replyToken")
+        if not reply_token:
             continue
 
-        reply_token = event.get("replyToken")
         message = event.get("message", {})
         msg_type = message.get("type")
 
         # テキスト
         if msg_type == "text":
-            user_text = message.get("text", "")
-            # いまは確認用：オウム返し
-            line_reply(reply_token, [{"type": "text", "text": f"受け取りました：{user_text}"}])
-            continue
+            text = message.get("text", "")
+            reply_message(reply_token, [
+                {"type": "text", "text": f"受け取りました：{text}\n\n（次：写真を送ると、メルカリで利益が出そうか判定します）\n写真を送ってみてください。"}
+            ])
 
         # 画像
-        if msg_type == "image":
-            message_id = message.get("id")
+        elif msg_type == "image":
+            # いまは「受け取った」まで確実に返す（ここがまず大事）
+            reply_message(reply_token, [
+                {"type": "text", "text": "画像を受け取りました。\nいまから商品を判定します。\n\n（次のステップで、画像内容をAI解析→メルカリ相場→利益見込みに進めます）"}
+            ])
 
-            # まずは「受け取った」返信（ここが大事）
-            line_reply(reply_token, [{"type": "text", "text": "画像を受け取りました！分析しますね。"}])
-
-            # 画像の取得（次ステップでAI解析に使う）
-            try:
-                img_bytes = fetch_line_image_bytes(message_id)
-                print(f"Image bytes received: {len(img_bytes)} bytes")
-            except Exception as e:
-                print("Failed to fetch image:", e)
-            continue
-
-        # その他（スタンプ等）
-        line_reply(reply_token, [{"type": "text", "text": f"{msg_type} を受け取りました（画像/文字が一番得意です）"}])
+        else:
+            reply_message(reply_token, [
+                {"type": "text", "text": f"{msg_type} を受け取りました（対応準備中）"}
+            ])
 
     return "OK"
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
