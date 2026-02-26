@@ -1,27 +1,26 @@
 import os
 import json
 import base64
-import time
-import re
 import requests
 from flask import Flask, request
 from openai import OpenAI
+import time
+import re
+import urllib.parse
 
 app = Flask(__name__)
 
-# ====== 設定 ======
-LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-
-# ユーザーごとに直近の解析結果を保存（Render再起動で消えます）
+# ユーザーごとに直近の解析結果を保存（メモリ上：Render再起動で消えます）
 USER_STATE = {}  # { userId: {"ts": epoch, "shipping_yen": int|None, "price_low": int|None, "price_high": int|None, "name": str, "keywords": [..]} }
 STATE_TTL_SEC = 60 * 60 * 6  # 6時間
 
+LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ====== 共通関数 ======
+
 def reply_message(reply_token: str, text: str):
-    """LINEへ返信（replyTokenは1回しか使えません）"""
     url = "https://api.line.me/v2/bot/message/reply"
     headers = {
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
@@ -35,31 +34,16 @@ def reply_message(reply_token: str, text: str):
     print("Reply status:", r.status_code, r.text)
     return r
 
+
 def fetch_line_image_bytes(message_id: str) -> bytes:
-    """LINEの画像本体を取得"""
     url = f"https://api-data.line.me/v2/bot/message/{message_id}/content"
     headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
     r = requests.get(url, headers=headers, timeout=30)
     r.raise_for_status()
     return r.content
 
-def cleanup_state():
-    now = time.time()
-    expired = [uid for uid, st in USER_STATE.items() if now - st.get("ts", 0) > STATE_TTL_SEC]
-    for uid in expired:
-        USER_STATE.pop(uid, None)
-
-def parse_yen_from_text(s: str):
-    s = (s or "").replace(",", "")
-    m = re.search(r"([0-9]{1,7})", s)
-    return int(m.group(1)) if m else None
-
-def compute_profit(sell_yen: int, cost_yen: int, ship_yen: int, fee_rate: float = 0.10) -> int:
-    fee = int(round(sell_yen * fee_rate))
-    return sell_yen - fee - ship_yen - cost_yen
 
 def analyze_image_for_mercari(image_bytes: bytes) -> dict:
-    """画像から商品推定（JSONのみ返すように誘導）"""
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     data_url = f"data:image/jpeg;base64,{b64}"
 
@@ -87,40 +71,65 @@ def analyze_image_for_mercari(image_bytes: bytes) -> dict:
 
     resp = client.responses.create(
         model="gpt-4.1-mini",
-        input=[{
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": prompt},
-                {"type": "input_image", "image_url": data_url},
-            ],
-        }],
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {"type": "input_image", "image_url": data_url},
+                ],
+            }
+        ],
     )
 
     text = (resp.output_text or "").strip()
 
-    # 万一余計な文が混ざった時の保険：最初の { から最後の } を抜く
+    # JSONだけを期待するが、万一混ざった時の保険：最初の { から最後の } を抜く
     if "{" in text and "}" in text:
-        text = text[text.find("{"):text.rfind("}") + 1]
+        text = text[text.find("{") : text.rfind("}") + 1]
 
     return json.loads(text)
 
-# ====== ルート ======
-@app.route("/", methods=["GET"])
-def home():
-    return "OK ROOT", 200
 
-@app.route("/webhook", methods=["GET", "POST"])
+def cleanup_state():
+    now = time.time()
+    expired = []
+    for uid, st in USER_STATE.items():
+        if now - st.get("ts", 0) > STATE_TTL_SEC:
+            expired.append(uid)
+    for uid in expired:
+        USER_STATE.pop(uid, None)
+
+
+def parse_yen_from_text(s: str):
+    s = s.replace(",", "")
+    m = re.search(r"([0-9]{1,7})", s)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def compute_profit(sell_yen: int, cost_yen: int, ship_yen: int, fee_rate: float = 0.10) -> int:
+    fee = int(round(sell_yen * fee_rate))
+    profit = sell_yen - fee - ship_yen - cost_yen
+    return profit
+
+
+def mercari_search_url(keyword: str) -> str:
+    # メルカリ検索リンク（ユーザーが開いて売れた相場を確認する）
+    q = urllib.parse.quote(keyword)
+    return f"https://jp.mercari.com/search?keyword={q}"
+
+
+@app.route("/webhook", methods=["POST"])
 def webhook():
-    # LINE検証やブラウザ確認用
-    if request.method == "GET":
-        return "OK WEBHOOK GET", 200
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        data = {}
 
-    data = request.get_json(silent=True) or {}
     print("Received:", json.dumps(data, ensure_ascii=False))
 
     events = data.get("events", [])
-    cleanup_state()
-
     for event in events:
         reply_token = event.get("replyToken")
         if not reply_token:
@@ -130,8 +139,10 @@ def webhook():
         message = event.get("message", {})
         msg_type = message.get("type")
 
+        cleanup_state()
+
         try:
-            # ===== 画像 =====
+            # ===== 画像が来たら：解析して保存 → 返信（リンク付き） =====
             if msg_type == "image":
                 message_id = message.get("id")
                 if not message_id:
@@ -139,48 +150,64 @@ def webhook():
                     continue
 
                 img_bytes = fetch_line_image_bytes(message_id)
-                info = analyze_image_for_mercari(img_bytes)  # dict
+                data = analyze_image_for_mercari(img_bytes)
 
-                ship = info.get("shipping_yen_guess")
-                pr = info.get("price_range_yen") or None
+                ship = data.get("shipping_yen_guess")
+                pr = data.get("price_range_yen") or None
                 low, high = (pr[0], pr[1]) if (isinstance(pr, list) and len(pr) == 2) else (None, None)
+
+                keywords = data.get("keywords") or []
+                kw_text = " / ".join(keywords[:3]) if keywords else "（不明）"
 
                 USER_STATE[user_id] = {
                     "ts": time.time(),
                     "shipping_yen": ship if isinstance(ship, int) else None,
                     "price_low": low if isinstance(low, int) else None,
                     "price_high": high if isinstance(high, int) else None,
-                    "name": info.get("name") or "不明",
-                    "keywords": info.get("keywords") or [],
-                    "title_example": (info.get("tips") or {}).get("title_example"),
+                    "name": data.get("name") or "不明",
+                    "keywords": keywords,
                 }
 
-                kw = USER_STATE[user_id]["keywords"]
-                kw_text = " / ".join(kw[:3]) if kw else "（不明）"
                 ship_text = f"{USER_STATE[user_id]['shipping_yen']}円" if USER_STATE[user_id]["shipping_yen"] else "不明"
                 pr_text = f"{low}〜{high}円" if (low and high) else "不明"
+
+                # 検索リンクは「一番強いキーワード」を使う（無ければ商品名）
+                key_for_url = keywords[0] if keywords else USER_STATE[user_id]["name"]
+                link = mercari_search_url(key_for_url)
 
                 reply = (
                     f"【商品推定】{USER_STATE[user_id]['name']}\n"
                     f"【検索】{kw_text}\n"
                     f"【送料目安】{ship_text}\n"
-                    f"【売価目安】{pr_text}\n\n"
-                    f"次に「仕入れ 980」のように仕入れ価格を送ってください。\n"
-                    f"売値を指定したい場合は「売値 2800」も一緒に送ると利益を確定できます。"
+                    f"【売価目安(推定)】{pr_text}\n\n"
+                    f"▼メルカリ検索（売れた相場の確認用）\n{link}\n\n"
+                    f"次に価格を送ってください：\n"
+                    f"・仕入れ 980\n"
+                    f"・売値 2800（希望売値）\n"
+                    f"・売れた 2800（実際に売れてる相場）"
                 )
                 reply_message(reply_token, reply)
                 continue
 
-            # ===== テキスト =====
+            # ===== テキストが来たら：仕入れ/売値/売れた で利益計算 =====
             if msg_type == "text":
                 user_text = (message.get("text") or "").strip()
 
-                cost = parse_yen_from_text(user_text) if "仕入" in user_text else None
-                sell = parse_yen_from_text(user_text) if "売" in user_text else None
+                cost = None
+                sell = None  # 売値/売れた のどちらでもここに入れる
+
+                if "仕入" in user_text:
+                    cost = parse_yen_from_text(user_text)
+
+                # 「売れた」優先、次に「売」
+                if "売れた" in user_text:
+                    sell = parse_yen_from_text(user_text)
+                elif "売" in user_text:
+                    sell = parse_yen_from_text(user_text)
 
                 st = USER_STATE.get(user_id)
 
-                # 仕入れ価格が来た
+                # 仕入れだけ来た場合：売値が無ければ推定中央値で仮計算
                 if cost is not None:
                     if not st:
                         reply_message(reply_token, "直前の画像が見つかりません。先に商品画像を送ってください。")
@@ -188,29 +215,36 @@ def webhook():
 
                     ship = st.get("shipping_yen") or 0
 
-                    # 売値が未指定なら中央値で仮、レンジも無ければ売値要求
                     if sell is None:
                         low = st.get("price_low")
                         high = st.get("price_high")
                         if low and high:
                             sell = int(round((low + high) / 2))
                         else:
-                            reply_message(reply_token, "仕入れ価格を受け取りました。売値も送ってください（例：売値 2800）。")
+                            reply_message(reply_token, "仕入れ価格OK。次に「売れた 2800」または「売値 2800」を送ってください。")
                             continue
 
                     profit = compute_profit(sell, cost, ship, fee_rate=0.10)
                     reply_message(reply_token, f"利益目安：{profit}円（売値{sell}円・送料{ship}円・手数料10%）")
                     continue
 
-                # 普通のテキスト
-                reply_message(reply_token, "画像を送ってください。仕入れは「仕入れ 980」、売値は「売値 2800」のように送れます。")
+                # 売値/売れた だけ来た場合：仕入れが無いので案内
+                if sell is not None and cost is None:
+                    reply_message(reply_token, "OK！次に「仕入れ 980」も送ってください（利益を確定します）。")
+                    continue
+
+                reply_message(reply_token, "画像を送ってください。価格は「仕入れ 980」「売れた 2800」「売値 2800」でOKです。")
                 continue
 
-            # その他（スタンプ等）
             reply_message(reply_token, f"{msg_type} を受け取りました（画像かテキストでお願いします）")
 
         except Exception as e:
             print("Error:", e)
             reply_message(reply_token, f"エラー：{type(e).__name__}")
 
-    return "OK", 200
+    return "OK"
+
+
+@app.route("/", methods=["GET"])
+def home():
+    return "LINE Bot is running"
