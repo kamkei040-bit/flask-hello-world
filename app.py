@@ -2,223 +2,195 @@ import os
 import json
 import base64
 import requests
-import time
-import re
 from flask import Flask, request
 from openai import OpenAI
+import time
+import re
 
 app = Flask(__name__)
 
-# ユーザーごとに直近の解析結果を保存（メモリ上：Render再起動で消えます）
+# メモリ保存
 USER_STATE = {}
-STATE_TTL_SEC = 60 * 60 * 6  # 6時間
+STATE_TTL_SEC = 60 * 60 * 6
 
-LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-
-def reply_message(reply_token: str, text: str):
+# -----------------------
+# LINE返信
+# -----------------------
+def reply_message(reply_token, text):
     url = "https://api.line.me/v2/bot/message/reply"
     headers = {
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
-        "Content-Type": "application/json",
+        "Content-Type": "application/json"
     }
     payload = {
         "replyToken": reply_token,
-        "messages": [{"type": "text", "text": text[:4900]}],
+        "messages": [{"type": "text", "text": text[:4900]}]
     }
-    r = requests.post(url, headers=headers, json=payload, timeout=20)
-    print("Reply status:", r.status_code, r.text)
-    return r
+
+    r = requests.post(url, headers=headers, json=payload)
+    print("Reply:", r.status_code, r.text)
 
 
-def fetch_line_image_bytes(message_id: str) -> bytes:
+# -----------------------
+# LINE Push送信（遅い処理用）
+# -----------------------
+def push_message(user_id, text):
+
+    url = "https://api.line.me/v2/bot/message/push"
+
+    headers = {
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "to": user_id,
+        "messages": [{"type": "text", "text": text[:4900]}]
+    }
+
+    r = requests.post(url, headers=headers, json=payload)
+    print("Push:", r.status_code, r.text)
+
+
+# -----------------------
+# LINE画像取得
+# -----------------------
+def fetch_line_image_bytes(message_id):
+
     url = f"https://api-data.line.me/v2/bot/message/{message_id}/content"
-    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
-    r = requests.get(url, headers=headers, timeout=30)
-    r.raise_for_status()
+
+    headers = {
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"
+    }
+
+    r = requests.get(url, headers=headers)
+
     return r.content
 
 
-def analyze_image_for_mercari(image_bytes: bytes) -> dict:
-    b64 = base64.b64encode(image_bytes).decode("utf-8")
-    data_url = f"data:image/jpeg;base64,{b64}"
+# -----------------------
+# AI解析
+# -----------------------
+def analyze_image(image_bytes):
 
-    prompt = """あなたは日本の物販（メルカリ）仕入れ判定アシスタントです。
-画像の商品をできるだけ正確に特定し、仕入れ判断に必要な情報を「JSONだけ」で返してください。
-（前後に文章をつけない。JSONのみ。）
+    b64 = base64.b64encode(image_bytes).decode()
 
-必須キー:
+    prompt = """
+画像の商品を特定してJSONのみ返してください
+
 {
-  "name": "商品名推定",
-  "brand": "ブランド/メーカー(不明ならnull)",
-  "model": "型番(不明ならnull)",
-  "jan": "JAN/EAN(不明ならnull)",
-  "category": "カテゴリ",
-  "condition_guess": "未使用/中古など",
-  "keywords": ["メルカリ検索ワード1","2","3"],
-  "shipping_yen_guess": 210,
-  "price_range_yen": [1800, 3500],
-  "tips": {
-    "title_example": "出品タイトル例（短く）",
-    "desc_points": ["説明に入れる要点1","2"]
-  }
+"name":"商品名",
+"keywords":["検索語1","検索語2"],
+"shipping_yen_guess":210,
+"price_range_yen":[1000,3000]
 }
 """
 
     resp = client.responses.create(
+
         model="gpt-4.1-mini",
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt},
-                    {"type": "input_image", "image_url": data_url},
-                ],
-            }
-        ],
+
+        input=[{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": prompt},
+                {"type": "input_image",
+                 "image_url": f"data:image/jpeg;base64,{b64}"}
+            ]
+        }]
     )
 
-    text = (resp.output_text or "").strip()
+    text = resp.output_text.strip()
 
-    # JSONだけを期待するが、万一混ざった時の保険：最初の { から最後の } を抜く
-    if "{" in text and "}" in text:
-        text = text[text.find("{"):text.rfind("}") + 1]
+    text = text[text.find("{"):text.rfind("}")+1]
 
     return json.loads(text)
 
 
-def cleanup_state():
-    now = time.time()
-    expired = []
-    for uid, st in USER_STATE.items():
-        if now - st.get("ts", 0) > STATE_TTL_SEC:
-            expired.append(uid)
-    for uid in expired:
-        USER_STATE.pop(uid, None)
+# -----------------------
+# 利益計算
+# -----------------------
+def profit_calc(sell, cost, ship):
+
+    fee = int(sell * 0.1)
+
+    return sell - cost - ship - fee
 
 
-def parse_yen_from_text(s: str):
-    s = s.replace(",", "")
-    m = re.search(r"([0-9]{1,7})", s)
-    if m:
-        return int(m.group(1))
-    return None
-
-
-def compute_profit(sell_yen: int, cost_yen: int, ship_yen: int, fee_rate: float = 0.10) -> int:
-    fee = int(round(sell_yen * fee_rate))
-    return sell_yen - fee - ship_yen - cost_yen
-
-
+# -----------------------
+# Webhook（重要）
+# -----------------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # LINE検証時にJSONとして解釈できない場合があるので、落ちないようにする
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict):
-        data = {}
 
-    print("Received:", json.dumps(data, ensure_ascii=False))
+    data = request.get_json(silent=True)
+
+    print("Received:", data)
+
+    if not data:
+        return "OK"
 
     events = data.get("events", [])
+
     for event in events:
+
         reply_token = event.get("replyToken")
-        if not reply_token:
-            continue
 
-        user_id = (event.get("source") or {}).get("userId") or "unknown"
-        message = event.get("message", {})
-        msg_type = message.get("type")
+        user_id = event.get("source", {}).get("userId")
 
-        cleanup_state()
+        msg = event.get("message", {})
+
+        msg_type = msg.get("type")
 
         try:
-            # 画像メッセージ
-            if msg_type == "image":
-                message_id = message.get("id")
-                if not message_id:
-                    reply_message(reply_token, "画像IDが取れませんでした。もう一度送ってください。")
-                    continue
 
-                img_bytes = fetch_line_image_bytes(message_id)
-                result = analyze_image_for_mercari(img_bytes)  # dict
+            # テキスト
+            if msg_type == "text":
+
+                text = msg.get("text")
+
+                reply_message(reply_token, f"受信：{text}")
+
+            # 画像
+            if msg_type == "image":
+
+                reply_message(reply_token, "画像受信。解析中...")
+
+                image_id = msg.get("id")
+
+                img = fetch_line_image_bytes(image_id)
+
+                result = analyze_image(img)
+
+                USER_STATE[user_id] = result
+
+                name = result.get("name")
+
+                price = result.get("price_range_yen")
 
                 ship = result.get("shipping_yen_guess")
-                pr = result.get("price_range_yen") or None
-                low, high = (pr[0], pr[1]) if (isinstance(pr, list) and len(pr) == 2) else (None, None)
 
-                USER_STATE[user_id] = {
-                    "ts": time.time(),
-                    "shipping_yen": ship if isinstance(ship, int) else None,
-                    "price_low": low if isinstance(low, int) else None,
-                    "price_high": high if isinstance(high, int) else None,
-                    "name": result.get("name") or "不明",
-                    "keywords": result.get("keywords") or [],
-                    "title_example": (result.get("tips") or {}).get("title_example"),
-                }
-
-                kw = USER_STATE[user_id]["keywords"]
-                kw_text = " / ".join(kw[:3]) if kw else "（不明）"
-                ship_text = f"{USER_STATE[user_id]['shipping_yen']}円" if USER_STATE[user_id]["shipping_yen"] else "不明"
-                pr_text = f"{low}〜{high}円" if (low and high) else "不明"
-
-                reply = (
-                    f"【商品推定】{USER_STATE[user_id]['name']}\n"
-                    f"【検索】{kw_text}\n"
-                    f"【送料目安】{ship_text}\n"
-                    f"【売価目安】{pr_text}\n\n"
-                    f"次に「仕入れ 980」のように仕入れ価格を送ってください。\n"
-                    f"売値を指定したい場合は「売値 2800」も一緒に送ると利益を確定できます。"
+                push_message(user_id,
+                    f"商品:{name}\n"
+                    f"価格:{price}\n"
+                    f"送料:{ship}"
                 )
-                reply_message(reply_token, reply)
-                continue
 
-            # テキストメッセージ
-            if msg_type == "text":
-                user_text = (message.get("text") or "").strip()
-
-                cost = parse_yen_from_text(user_text) if "仕入" in user_text else None
-                sell = parse_yen_from_text(user_text) if "売" in user_text else None
-
-                st = USER_STATE.get(user_id)
-
-                if cost is not None:
-                    if not st:
-                        reply_message(reply_token, "直前の画像が見つかりません。先に商品画像を送ってください。")
-                        continue
-
-                    ship = st.get("shipping_yen") or 0
-
-                    if sell is None:
-                        low = st.get("price_low")
-                        high = st.get("price_high")
-                        if low and high:
-                            sell = int(round((low + high) / 2))
-                        else:
-                            reply_message(reply_token, "仕入れ価格を受け取りました。売値も送ってください（例：売値 2800）。")
-                            continue
-
-                    profit = compute_profit(sell, cost, ship, fee_rate=0.10)
-                    reply_message(reply_token, f"利益目安：{profit}円（売値{sell}円・送料{ship}円・手数料10%）")
-                    continue
-
-                reply_message(reply_token, "画像を送ってください。仕入れ価格は「仕入れ 980」、売値は「売値 2800」のように送れます。")
-                continue
-
-            # その他（スタンプなど）
-            reply_message(reply_token, f"{msg_type} を受け取りました（画像かテキストでお願いします）")
-
-        except json.JSONDecodeError:
-            reply_message(reply_token, "解析結果の形式が崩れました。別角度の写真で再送してください。")
         except Exception as e:
+
             print("Error:", e)
-            reply_message(reply_token, f"エラー：{type(e).__name__}")
 
     return "OK"
 
 
+# -----------------------
+# 動作確認用
+# -----------------------
 @app.route("/", methods=["GET"])
 def home():
-    return "LINE Bot is running"
+    return "LINE BOT OK"
