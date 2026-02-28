@@ -151,16 +151,15 @@ def webhook():
 
         try:
             # ===== 画像 =====
+            # ===== 画像 =====
             if msg_type == "image":
                 message_id = message.get("id")
                 if not message_id:
                     reply_message(reply_token, "画像IDが取れませんでした。もう一度送ってください。")
                     continue
 
-                # まず即返信（これが重要）
                 reply_message(reply_token, "画像を受け取りました。解析中です…（数秒〜20秒）")
 
-                # 解析（時間かかってもOK）
                 img_bytes = fetch_line_image_bytes(message_id)
                 result = analyze_image_for_mercari(img_bytes)
 
@@ -186,8 +185,6 @@ def webhook():
                 pr_text = f"{low}〜{high}円" if (isinstance(low, int) and isinstance(high, int)) else "不明"
                 link = mercari_search_url(keywords[0] if keywords else name)
 
-                link = mercari_search_url(keywords[0] if keywords else name)
-
                 msg = (
                     f"【商品推定】{name}\n"
                     f"【検索】{kw_text}\n"
@@ -201,13 +198,12 @@ def webhook():
                     f"・売値 2800（希望売値）"
                 )
 
-                # Pushで送る
                 if user_id:
                     push_message(user_id, msg)
                 else:
                     print("No userId. Push cannot be sent.")
-                continue
 
+                continue
                 # Pushで送る
                 if user_id:
                     push_message(user_id, msg)
