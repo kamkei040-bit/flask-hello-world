@@ -186,18 +186,27 @@ def webhook():
                 pr_text = f"{low}〜{high}円" if (isinstance(low, int) and isinstance(high, int)) else "不明"
                 link = mercari_search_url(keywords[0] if keywords else name)
 
-msg = (
-    f"【商品推定】{name}\n"
-    f"【検索】{kw_text}\n"
-    f"【送料目安】{ship_text}\n"
-    f"【売価目安(推定)】{pr_text}\n\n"
-    f"▼メルカリ検索（売れた相場の確認用）\n{link}\n"
-    f"※アプリで開かない場合：リンク長押し →「ブラウザで開く」（外部ブラウザ）\n\n"
-    f"次に価格を送ってください：\n"
-    f"・仕入れ 980\n"
-    f"・売れた 2800（実相場）\n"
-    f"・売値 2800（希望売値）"
-)
+                link = mercari_search_url(keywords[0] if keywords else name)
+
+                msg = (
+                    f"【商品推定】{name}\n"
+                    f"【検索】{kw_text}\n"
+                    f"【送料目安】{ship_text}\n"
+                    f"【売価目安(推定)】{pr_text}\n\n"
+                    f"▼メルカリ検索（売れた相場の確認用）\n{link}\n"
+                    f"※アプリで開かない場合：リンク長押し →「ブラウザで開く」（外部ブラウザ）\n\n"
+                    f"次に価格を送ってください：\n"
+                    f"・仕入れ 980\n"
+                    f"・売れた 2800（実相場）\n"
+                    f"・売値 2800（希望売値）"
+                )
+
+                # Pushで送る
+                if user_id:
+                    push_message(user_id, msg)
+                else:
+                    print("No userId. Push cannot be sent.")
+                continue
 
                 # Pushで送る
                 if user_id:
